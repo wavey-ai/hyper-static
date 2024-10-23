@@ -204,24 +204,19 @@ async fn handle_connection(
     loop {
         match conn.accept().await {
             Ok(Some((req, stream))) => {
-                let ext = req.extensions();
-                match req.method() {
-                    _ => {
-                        let cache = Arc::clone(&cache);
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_request_h3(req, stream, cache).await {
-                                error!("handling request failed: {}", e);
-                            }
-                        });
-                        return Ok(());
+                let cache = Arc::clone(&cache);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_request_h3(req, stream, cache).await {
+                        error!("Handling request failed: {}", e);
                     }
-                }
+                });
             }
             Ok(None) => {
+                info!("Connection closed gracefully");
                 break;
             }
             Err(err) => {
-                error!("error on accept {}", err);
+                info!("Connection error: {}", err);
                 break;
             }
         }
@@ -321,7 +316,14 @@ async fn handle_request_h3(
         }
     }
 
-    Ok(stream.finish().await?)
+    if let Err(e) = stream.finish().await {
+        error!("Error finishing stream: {}", e);
+        // Decide whether to return the error or ignore it
+        // For now, we'll return the error to propagate it
+        return Err(e.into());
+    }
+
+    Ok(())
 }
 
 async fn request_handler(
@@ -340,34 +342,46 @@ async fn request_handler(
             (StatusCode::NOT_IMPLEMENTED, None, None)
         }
         (&Method::GET, path) => {
-            // Remove leading slashes and split the path
-            let path = path.trim_start_matches('/');
-            let file_path = PathBuf::from("public");
+            let keys: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
-            // If the path is empty, default to serving "index.html"
-            let file_path = if path.is_empty() {
-                file_path.join("index.html")
+            if keys.is_empty() {
+                (StatusCode::NOT_FOUND, None, None)
+            } else if keys[0] == "up" {
+                (
+                    StatusCode::OK,
+                    Some((Bytes::from("OK"), 0)),
+                    Some("text/plain".into()),
+                )
             } else {
-                file_path.join(path)
-            };
+                // Remove leading slashes and split the path
+                let path = path.trim_start_matches('/');
+                let file_path = PathBuf::from("public");
 
-            // Attempt to read the file asynchronously
-            match fs::read(&file_path).await {
-                Ok(contents) => {
-                    // Guess the MIME type based on the file extension
-                    let mime_type = mime_guess::from_path(&file_path)
-                        .first_or_octet_stream()
-                        .to_string();
+                // If the path is empty, default to serving "index.html"
+                let file_path = if path.is_empty() {
+                    file_path.join("index.html")
+                } else {
+                    file_path.join(path)
+                };
 
-                    (
-                        StatusCode::OK,
-                        Some((Bytes::from(contents), 0)),
-                        Some(mime_type),
-                    )
-                }
-                Err(err) => {
-                    eprintln!("Error reading file {:?}: {}", file_path, err);
-                    (StatusCode::NOT_FOUND, None, None)
+                // Attempt to read the file asynchronously
+                match fs::read(&file_path).await {
+                    Ok(contents) => {
+                        // Guess the MIME type based on the file extension
+                        let mime_type = mime_guess::from_path(&file_path)
+                            .first_or_octet_stream()
+                            .to_string();
+
+                        (
+                            StatusCode::OK,
+                            Some((Bytes::from(contents), 0)),
+                            Some(mime_type),
+                        )
+                    }
+                    Err(err) => {
+                        eprintln!("Error reading file {:?}: {}", file_path, err);
+                        (StatusCode::NOT_FOUND, None, None)
+                    }
                 }
             }
         }
