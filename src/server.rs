@@ -240,14 +240,15 @@ async fn handle_request_h2(
             .headers_mut()
             .insert("etag", format!("{}", data.1).parse().unwrap());
 
-        if content_type == "application/vnd.apple.mpegurl" {
+        if let Some(enc) = content_encoding {
             response
                 .headers_mut()
-                .insert("content-encoding", "gzip".parse().unwrap());
+                .insert("content-encoding", enc.parse().unwrap());
             response
                 .headers_mut()
                 .insert("vary", "accept-encoding".parse().unwrap());
         }
+
         add_cors_headers(&mut response);
         Ok(response)
     } else {
@@ -275,11 +276,13 @@ async fn handle_request_h3(
             .status(status)
             .header("content-type", content_type.clone())
             .header("etag", data.1);
-        if content_type == "application/vnd.apple.mpegurl" {
+
+        if let Some(enc) = content_encoding {
             r = r
-                .header("content-encoding", "gzip")
+                .header("content-encoding", enc)
                 .header("vary", "accept-encoding");
         }
+
         let resp = r.body(()).unwrap();
 
         match stream.send_response(resp).await {
