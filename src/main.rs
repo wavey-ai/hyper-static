@@ -2,7 +2,6 @@ use hyper_static::server::HyperStatic;
 use std::env;
 use std::path::PathBuf;
 use structopt::StructOpt;
-use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[derive(Debug, StructOpt)]
