@@ -338,11 +338,7 @@ async fn request_handler(
         (&Method::GET, path) => {
             let keys: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
-            let accepts_gzip = true;
-
-            if keys.is_empty() {
-                (StatusCode::NOT_FOUND, None, None, None)
-            } else if keys[0] == "up" {
+            if !keys.is_empty() && keys[0] == "up" {
                 (
                     StatusCode::OK,
                     Some((Bytes::from("OK"), 0)),
@@ -350,6 +346,9 @@ async fn request_handler(
                     None,
                 )
             } else {
+                // TODO
+                let accepts_gzip = true;
+
                 match cache.get_bytes(path, accepts_gzip).await {
                     Ok((bytes, etag, mime_type, is_compressed)) => {
                         let content_encoding = if is_compressed {
