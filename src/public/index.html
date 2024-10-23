@@ -1,0 +1,157 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <!-- Include Tailwind CSS -->
+    <link
+      href="https://cdn.jsdelivr.net/npm/tailwindcss/dist/tailwind.min.css"
+      rel="stylesheet"
+    />
+  </head>
+  <body class="bg-gray-900 flex justify-center items-center h-screen">
+    <script src="/hls.min.js"></script>
+
+    <script>
+      const create = (video) => {
+        if (Hls.isSupported()) {
+          const hls = new Hls({
+            debug: false,
+            lowLatencyMode: true,
+            enableWorker: true,
+            //"maxBufferLength": 1,
+            //"liveBackBufferLength": 0,
+            //"liveSyncDuration": 0,
+            //"liveMaxLatencyDuration": 5,
+            //"liveDurationInfinity": true,
+            //"highBufferWatchdogPeriod": 1,
+          });
+
+          hls.on(Hls.Events.MANIFEST_LOADED, function () {
+            const liveEdge = hls.liveSyncPosition;
+            hls.startLoad(liveEdge);
+            hls.media.currentTime = liveEdge;
+          });
+
+          hls.on(Hls.Events.ERROR, (evt, data) => {
+            console.log(data);
+
+            if (data.fatal) {
+              hls.destroy();
+
+              setTimeout(create, 500);
+            }
+          });
+
+          const urlParams = new URLSearchParams(window.location.search);
+
+          const streamid = window.location.href.split("/")[4];
+          hls.loadSource(`/${streamid}/stream.m3u8`);
+
+          hls.attachMedia(video);
+
+          video.play();
+        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          // since it's not possible to detect timeout errors in iOS,
+          // wait for the playlist to be available before starting the stream
+          fetch("").then(() => {
+            video.src = "";
+            video.play();
+          });
+        }
+      };
+
+      /**
+       * Parses the query string from a URL into an object representing the query parameters.
+       * If no URL is provided, it uses the query string from the current page's URL.
+       *
+       * @param {string} [url=window.location.search] - The URL to parse the query string from.
+       * @returns {Object} An object representing the query parameters with keys as parameter names and values as parameter values.
+       */
+      const parseQueryString = (url) => {
+        const queryString = (url || window.location.search).split("?")[1];
+        if (!queryString) return {};
+
+        const paramsArray = queryString.split("&");
+        const result = {};
+
+        for (let i = 0; i < paramsArray.length; i++) {
+          const param = paramsArray[i].split("=");
+          const key = decodeURIComponent(param[0]);
+          const value = decodeURIComponent(param[1] || "");
+
+          if (key) {
+            if (result[key]) {
+              if (Array.isArray(result[key])) {
+                result[key].push(value);
+              } else {
+                result[key] = [result[key], value];
+              }
+            } else {
+              result[key] = value;
+            }
+          }
+        }
+
+        return result;
+      };
+
+      /**
+       * Parses a string with boolean-like values and returns a boolean.
+       * @param {string} str The string to parse
+       * @param {boolean} defaultVal The default value
+       * @returns {boolean}
+       */
+      const parseBoolString = (str, defaultVal) => {
+        const trueValues = ["1", "yes", "true"];
+        const falseValues = ["0", "no", "false"];
+        str = (str || "").toString();
+
+        if (trueValues.includes(str.toLowerCase())) {
+          return true;
+        } else if (falseValues.includes(str.toLowerCase())) {
+          return false;
+        } else {
+          return defaultVal;
+        }
+      };
+
+      /**
+       * Sets video attributes based on query string parameters or default values.
+       *
+       * @param {HTMLVideoElement} video - The video element on which to set the attributes.
+       */
+      const setVideoAttributes = (video) => {
+        let qs = parseQueryString();
+
+        video.controls = parseBoolString(qs["controls"], true);
+        video.muted = parseBoolString(qs["muted"], true);
+        video.autoplay = parseBoolString(qs["autoplay"], true);
+        video.playsInline = parseBoolString(qs["playsinline"], true);
+      };
+
+      /**
+       *
+       * @param {(video: HTMLVideoElement) => void} callback
+       * @param {HTMLElement} container
+       * @returns
+       */
+      const initVideoElement = (callback, container) => {
+        return () => {
+          const video = document.createElement("video");
+          video.id = "video";
+          video.classList.add("shadow-xg", "w-full", "h-auto", "m-32");
+
+          setVideoAttributes(video);
+          container.append(video);
+          callback(video);
+        };
+      };
+
+      window.addEventListener(
+        "DOMContentLoaded",
+        initVideoElement(create, document.body),
+      );
+    </script>
+  </body>
+</html>
