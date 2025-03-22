@@ -1,5 +1,6 @@
 use crate::cache::Cache;
 use anyhow::Result;
+use bytes::Buf;
 use bytes::Bytes;
 use h3::server::Connection;
 use h3::server::RequestStream;
@@ -13,7 +14,7 @@ use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tls_helpers::{certs_from_base64, privkey_from_base64, tls_acceptor_from_base64};
+use tls_helpers::{load_certs_from_base64, load_keys_from_base64, tls_acceptor_from_base64};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 use tracing::{error, info};
@@ -55,7 +56,7 @@ impl HyperStatic {
         let (up_tx, up_rx) = oneshot::channel();
         let (fin_tx, fin_rx) = oneshot::channel();
 
-        info!("Starting hyper-static server");
+        info!("Starting hyper-upload server");
 
         {
             let addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), self.ssl_port);
@@ -114,13 +115,9 @@ impl HyperStatic {
             tokio::spawn(srv_h2);
         }
 
-        let certs = certs_from_base64(&self.fullchain_pem_base64)?;
-        let key = privkey_from_base64(&self.privkey_pem_base64)?;
+        let certs = load_certs_from_base64(&self.fullchain_pem_base64)?;
+        let key = load_keys_from_base64(&self.privkey_pem_base64)?;
         let mut tls_config = rustls::ServerConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .unwrap();
@@ -129,7 +126,9 @@ impl HyperStatic {
         let alpn: Vec<Vec<u8>> = vec![b"h3".to_vec()];
         tls_config.alpn_protocols = alpn;
 
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_config));
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?,
+        ));
         let addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), self.ssl_port);
         let endpoint = quinn::Endpoint::server(server_config, addr).unwrap();
 
@@ -151,7 +150,6 @@ impl HyperStatic {
                                     match new_conn.await {
                                         Ok(conn) => {
                                             let h3_conn = h3::server::builder()
-                                                .enable_connect(true)
                                                 .send_grease(true)
                                                 .build(h3_quinn::Connection::new(conn))
                                                 .await
@@ -219,6 +217,50 @@ async fn handle_request_h2(
     cache: Arc<Cache>,
     ssl_port: u16,
 ) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
+    if req.method() == Method::POST && req.uri().path().starts_with("/upload") {
+        let filename = req.uri().query().and_then(|q| {
+            url::form_urlencoded::parse(q.as_bytes()).find_map(|(k, v)| {
+                if k == "filename" {
+                    Some(v.to_string())
+                } else {
+                    None
+                }
+            })
+        });
+
+        let (_, body) = req.into_parts();
+
+        match process_upload(body, filename).await {
+            Ok(file_path) => {
+                let mut response = Response::new(Full::from(Bytes::from(file_path)));
+                *response.status_mut() = StatusCode::OK;
+                response.headers_mut().insert(
+                    "alt-srv",
+                    format!("h3=\":{}\"; ma=2592000", ssl_port).parse().unwrap(),
+                );
+                response
+                    .headers_mut()
+                    .insert("content-type", "text/plain".parse().unwrap());
+                add_cors_headers(&mut response);
+                return Ok(response);
+            }
+            Err(e) => {
+                let mut response =
+                    Response::new(Full::from(Bytes::from(format!("Upload failed: {}", e))));
+                *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                response.headers_mut().insert(
+                    "alt-srv",
+                    format!("h3=\":{}\"; ma=2592000", ssl_port).parse().unwrap(),
+                );
+                response
+                    .headers_mut()
+                    .insert("content-type", "text/plain".parse().unwrap());
+                add_cors_headers(&mut response);
+                return Ok(response);
+            }
+        }
+    }
+
     let (status, data, content_type, content_encoding) = request_handler(
         req.method(),
         req.uri().path(),
@@ -268,6 +310,52 @@ async fn handle_request_h3(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     cache: Arc<Cache>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if req.method() == Method::POST && req.uri().path().starts_with("/upload") {
+        let filename = req.uri().query().and_then(|q| {
+            url::form_urlencoded::parse(q.as_bytes()).find_map(|(k, v)| {
+                if k == "filename" {
+                    Some(v.to_string())
+                } else {
+                    None
+                }
+            })
+        });
+
+        let mut body_data = Vec::new();
+        while let Ok(Some(mut chunk)) = stream.recv_data().await {
+            let bytes = chunk.copy_to_bytes(chunk.remaining());
+            body_data.extend_from_slice(&bytes);
+        }
+        let body_bytes = Bytes::from(body_data);
+
+        match process_upload_bytes(body_bytes, filename).await {
+            Ok(file_path) => {
+                let resp = http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain")
+                    .body(())
+                    .unwrap();
+
+                stream.send_response(resp).await?;
+                stream.send_data(Bytes::from(file_path)).await?;
+            }
+            Err(e) => {
+                let resp = http::Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "text/plain")
+                    .body(())
+                    .unwrap();
+
+                stream.send_response(resp).await?;
+                stream
+                    .send_data(Bytes::from(format!("Upload failed: {}", e)))
+                    .await?;
+            }
+        }
+
+        return Ok(stream.finish().await?);
+    }
+
     let (status, data, content_type, content_encoding) =
         request_handler(req.method(), req.uri().path(), req.uri().query(), cache).await?;
 
@@ -308,14 +396,7 @@ async fn handle_request_h3(
         }
     }
 
-    if let Err(e) = stream.finish().await {
-        error!("Error finishing stream: {}", e);
-        // Decide whether to return the error or ignore it
-        // For now, we'll return the error to propagate it
-        return Err(e.into());
-    }
-
-    Ok(())
+    Ok(stream.finish().await?)
 }
 
 async fn request_handler(
@@ -334,7 +415,7 @@ async fn request_handler(
 > {
     let res = match (method, path) {
         (&Method::OPTIONS, _) => (StatusCode::OK, None, None, None),
-        (&Method::HEAD, path) => (StatusCode::NOT_IMPLEMENTED, None, None, None),
+        (&Method::HEAD, _) => (StatusCode::NOT_IMPLEMENTED, None, None, None),
         (&Method::GET, path) => {
             let keys: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
@@ -346,7 +427,6 @@ async fn request_handler(
                     None,
                 )
             } else {
-                // TODO
                 let accepts_gzip = true;
 
                 match cache.get_bytes(path, accepts_gzip).await {
@@ -376,10 +456,129 @@ async fn request_handler(
                 }
             }
         }
+        (&Method::POST, path) => {
+            let keys: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+            if !keys.is_empty() && keys[0] == "upload" {
+                (
+                    StatusCode::OK,
+                    Some((Bytes::from("Upload endpoint ready"), 0)),
+                    Some("text/plain".into()),
+                    None,
+                )
+            } else {
+                (StatusCode::NOT_FOUND, None, None, None)
+            }
+        }
         _ => (StatusCode::METHOD_NOT_ALLOWED, None, None, None),
     };
 
     Ok(res)
+}
+
+async fn process_upload(
+    body: Incoming,
+    filename_hint: Option<String>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use http_body_util::BodyExt;
+    use sha2::{Digest, Sha256};
+    use tokio::fs;
+    use tokio::io::AsyncWriteExt;
+
+    let upload_dir = std::path::Path::new("./uploads");
+    if !upload_dir.exists() {
+        fs::create_dir_all(upload_dir).await?;
+    }
+
+    let body_bytes = body.collect().await?.to_bytes();
+
+    if body_bytes.is_empty() {
+        return Err("Empty file content".into());
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&body_bytes);
+    let hash_result = hasher.finalize();
+
+    let content_hash = URL_SAFE_NO_PAD.encode(hash_result);
+
+    let ext = if let Some(hint) = filename_hint {
+        std::path::Path::new(&hint)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        "bin".to_string()
+    };
+
+    let filename = if ext.is_empty() {
+        content_hash.clone()
+    } else {
+        format!("{}.{}", content_hash, ext)
+    };
+
+    let file_path = upload_dir.join(&filename);
+
+    if !file_path.exists() {
+        let mut file = fs::File::create(&file_path).await?;
+        file.write_all(&body_bytes).await?;
+        file.flush().await?;
+    }
+
+    Ok(content_hash)
+}
+
+async fn process_upload_bytes(
+    bytes: Bytes,
+    filename_hint: Option<String>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use sha2::{Digest, Sha256};
+    use tokio::fs;
+    use tokio::io::AsyncWriteExt;
+
+    let upload_dir = std::path::Path::new("./uploads");
+    if !upload_dir.exists() {
+        fs::create_dir_all(upload_dir).await?;
+    }
+
+    if bytes.is_empty() {
+        return Err("Empty file content".into());
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let hash_result = hasher.finalize();
+
+    let content_hash = URL_SAFE_NO_PAD.encode(hash_result);
+
+    let ext = if let Some(hint) = filename_hint {
+        std::path::Path::new(&hint)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        "bin".to_string()
+    };
+
+    let filename = if ext.is_empty() {
+        content_hash.clone()
+    } else {
+        format!("{}.{}", content_hash, ext)
+    };
+
+    let file_path = upload_dir.join(&filename);
+
+    if !file_path.exists() {
+        let mut file = fs::File::create(&file_path).await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+    }
+
+    Ok(content_hash)
 }
 
 fn add_cors_headers(res: &mut http::Response<http_body_util::Full<Bytes>>) {
@@ -387,7 +586,7 @@ fn add_cors_headers(res: &mut http::Response<http_body_util::Full<Bytes>>) {
         .insert("access-control-allow-origin", "*".parse().unwrap());
     res.headers_mut().insert(
         "access-control-allow-methods",
-        "GET, OPTIONS".parse().unwrap(),
+        "GET, POST, OPTIONS".parse().unwrap(),
     );
     res.headers_mut()
         .insert("access-control-allow-headers", "*".parse().unwrap());

@@ -1,4 +1,5 @@
-use hyper_static::server::HyperStatic;
+use hyper_upload::server::HyperStatic;
+use rustls::crypto::CryptoProvider;
 use std::env;
 use std::path::PathBuf;
 use structopt::StructOpt;
@@ -19,6 +20,10 @@ struct Command {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     const ENV_FILE: &str = include_str!("../.env");
     for line in ENV_FILE.lines() {
         if let Some((key, value)) = line.split_once('=') {
